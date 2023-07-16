@@ -1,0 +1,314 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri May 13 09:14:51 2022
+
+@author: fcliment
+"""
+
+import nastran_pch_reader
+import numpy as np
+import matplotlib.pyplot as plt
+import xlsxwriter
+import openpyxl
+import os
+import copy
+import numpy as np
+import matplotlib.pyplot as plt
+
+import pyNastran
+
+from pyNastran.bdf.bdf import BDF
+from pyNastran.op2.op2 import read_op2
+from pyNastran.utils import object_methods, object_attributes
+from pyNastran.utils.nastran_utils import run_nastran
+
+
+def freadBdf(filename):
+    global model
+
+    model = BDF()
+    model.read_bdf(filename,xref=True, encoding='latin1')
+    return model
+
+def get_vib(file,fr,nd,it):
+    amp=0
+    parser = nastran_pch_reader.PchParser(file)
+    # summary of the forces at the elemeks
+    
+    
+    #accels=parser.get_displacemeks(2)
+    displ = parser.get_displacements(1)
+    freq = parser.get_frequencies(1)
+    
+    
+    #node = [5482,5057,7565,1313,1107,8361,1830,1483,8127,2534,2437,7768,2836,7266,7281]
+    #node = [51965984,51795741,51800053]
+    
+    workbook = xlsxwriter.Workbook(wdir+'SOL111_beam_'+str(it)+'.xls')
+    worksheet = workbook.add_worksheet("nodes")
+    j=1
+    for i in range(0,len(freq)):
+        
+        worksheet.write(i+1,0,freq[i])
+        
+    for n in displ.keys():
+        data = displ[n]	
+        worksheet.write(0,j,str(n))
+    
+        for i in range(0,len(freq)):
+            
+            abs_displ = np.sqrt(np.abs(data[i][0])**2 + np.abs(data[i][1])**2 + np.abs(data[i][2])**2)
+            worksheet.write(i+1,j,abs_displ)
+            
+            if freq[i] > fr and nd == n:                
+                amp = np.sqrt(np.abs(data[i][0])**2 + np.abs(data[i][1])**2 + np.abs(data[i][2])**2)
+                break
+        j=j+1
+        
+    
+    workbook.close()
+    
+    return amp
+
+def get_shape_value(file_model,file_modes_op2,nd):
+      
+    fr = []
+    model=freadBdf(file_model)
+    modes_matrix=read_op2(file_modes_op2, debug=True)
+    # kmv_matrix=read_op2(kmv_op2, debug=True)
+    
+    nodes=sorted(model.nodes.items())
+    
+    
+    eig1 = modes_matrix.eigenvectors[1]
+    nmodes = eig1.modes
+    fr = eig1.mode_cycles
+    modes = eig1.data
+    
+    phi = np.zeros(len(nmodes), dtype = float)
+    
+    #mode amplitude in z axis, excitation diraction and PD position
+    for nmode in nmodes:
+        phi[nmode-1] = np.sqrt(modes[nmode-1,nd,0]**2+modes[nmode-1,nd,1]**2+modes[nmode-1,nd,2]**2)
+    
+    
+    #Deleting the 5 RBM that the op2 cokains
+    # fr = fr[5:]
+    # phi = phi[5:]
+    return fr,phi
+
+def get_eff_data(file,fr,vib):
+    
+    dlfv=0
+    meffv=0
+    edissv = 0
+    
+    eff_data = openpyxl.load_workbook(file)
+    
+    Dlf = eff_data['DLF']
+    Meff = eff_data['M_Eff']
+    Ediss = eff_data['E_Diss']
+    
+    
+    for row in range(2,Dlf.max_row):
+        val = Dlf.cell(row,1).value
+        if val > fr:
+            
+            for col in range(2,Dlf.max_column):
+                val = Dlf.cell(1,col).value
+                if val > vib:
+                    dlfv = Dlf.cell(row,col).value
+                    break
+            break
+                    
+
+    for row in range(2,Meff.max_row):
+        val = Meff.cell(row,1).value
+        if val > fr:
+            
+            for col in range(2,Meff.max_column):
+                val = Meff.cell(1,col).value
+                if val > vib:
+                    meffv = Meff.cell(row,col).value
+                    break
+            break
+    
+    for row in range(2,Ediss.max_row):
+        val = Ediss.cell(row,1).value
+        if val > fr:
+            
+            for col in range(2,Ediss.max_column):
+                val = Ediss.cell(1,col).value
+                if val > vib:
+                    edissv = Ediss.cell(row,col).value
+                    break
+            break
+                    
+            
+            
+    
+    
+    
+    return dlfv, meffv, edissv
+
+
+#plt.figure(1)
+#plt.plot(freq[0:1000],np.log(data_x[0:1000]))    
+
+
+def fresp_recalc(file_model,tabdmp,it,freq):
+    
+    freq_bdf=[]
+    tabdmp_bdf=[]
+    freq_bdf=copy.deepcopy(freq)
+    tabdmp_bdf=copy.deepcopy(tabdmp)
+    tabdmp_bdf=tabdmp
+    model = freadBdf(file_model)
+    tabdmps = list (model.tables_sdamping.keys())
+    tabdmpnum=tabdmps[len(tabdmps)-1]+1
+    freq_bdf.insert(0,0.0)
+    freq_bdf.insert(len(freq_bdf),5000.0)
+    tabdmp_bdf=tabdmp
+    tabdmp_bdf=tabdmp_bdf.tolist()
+    tabdmp_bdf.insert(0,0.0001)
+    tabdmp_bdf.insert(len(tabdmp_bdf),0.0001)
+    model.add_tabdmp1(tabdmpnum, freq_bdf, tabdmp_bdf,'G')
+    model.case_control_deck.add_parameter_to_local_subcase(1, 'SDAMPING='+str(tabdmpnum))
+    it_bdf = file_model[:len(file_model)-4]+ '_'+ str(it) +'.bdf'
+    model.write_bdf(it_bdf)
+    wnastran = 'C:\\MSC.Software\\MSC_Nastran\\bin\\'
+    pchfile = it_bdf[:len(it_bdf)-4]+'.pch'
+    run_nastran(it_bdf,wnastran+'nastranw.exe')
+
+    return pchfile
+    
+
+if __name__ == '__main__':
+    global wdir
+    wdir = 'Z:\\Soft\\0.NEW_DIAMONDS\\'
+    k=0
+    file_fresp = wdir+"SOL111_beam_emp.pch"
+    file_eff = wdir+'eff_files\\pod_bed_6-3_Stainlessf_results.xlsx'
+    
+    pkg_path = pyNastran.__path__[0]
+    bdf_filename= wdir+'SOL111_beam_emp.dat'
+    modes_op2= wdir+'struct_modes_free.op2'
+    kmv_op2= wdir+'struct_matrices_free.op2'
+    
+    nd = 15
+    frs, phi_sh = get_shape_value(bdf_filename,modes_op2,nd)
+    print('phi_sh '+str(phi_sh))
+    nd = 20
+    frs, phi_pd = get_shape_value(bdf_filename,modes_op2,nd)
+    print('phi_pd '+str(phi_pd))
+    dlf = np.zeros((len(frs),),dtype = float)
+    vib_pd = np.zeros((len(frs),),dtype = float)
+    meff = np.zeros((len(frs),),dtype = float)
+    ediss = np.zeros((len(frs),),dtype = float)
+    Qk = np.zeros((len(frs),),dtype = float)
+    deff = np.zeros((len(frs),),dtype = float)
+    xik = np.zeros((len(frs),),dtype = float)
+    xik_prev = np.zeros((len(frs),),dtype = float)
+    wk_eff = np.zeros((len(frs),),dtype = float)
+    d = np.zeros((len(frs),),dtype = float)
+    tabdmp = np.zeros((len(frs),),dtype = float)
+    Xk = np.zeros((len(frs),),dtype = float)
+    gammak = np.zeros((len(frs),),dtype = float)
+    tabdmpi = [0.001,0.001,0.001,0.001,0.001,0.001,0.001,0.001,0.001,0.001,0.001,0.001,0.001,0.001]
+  
+    #tabdamp1 = [5.65784e-07,4.34448e-07,2.41429e-07,1.86158e-07,1.55873e-07,1.51443e-07,1.17228e-07,1.02702e-07,8.6897e-08,8.5978e-08]
+
+    
+    tabdmp = tabdmpi
+    it=1
+   
+    while xik[1] > -1:
+        
+        #store the previos xi value
+        xik_prev = copy.deepcopy(xik)
+    
+        #calculates the arrays containing the values for each mode
+        k=0
+        for fr in frs:
+            
+            disp = get_vib(file_fresp,fr,nd,it-1) 
+            
+            acc = disp*(2*3.1415*fr)**2
+            
+            if acc > 45.0:
+                acc = 45.0
+            
+            vib_pd[k] = acc/9.81
+            
+            dlf[k], meff[k], ediss[k] = get_eff_data(file_eff,frs[k],vib_pd[k])
+            k=k+1
+        k=0
+        
+        ediss = ediss*2*3.1415  #because the eddis that I store with the pd_scan is the E_dis per radian and in the paper formula 
+                                #is using e_diss per cycle
+        
+        print("dlf "+ str(dlf))
+        print("m_eff "+ str(meff))
+        print("e_diss "+ str(ediss))
+        #calculation of deff    
+        for fr in frs:
+            deff[k] = ediss[k]/(3.1415*frs[k]*(vib_pd[k]*9.81/(2*3.1415*frs[k])**2)**2)
+            k=k+1
+        print("d_eff "+ str(deff))
+        #calculation of wk_eff
+        k=0    
+        for fr in frs:
+            wk_eff[k] = frs[k]*np.sqrt(1/(1+phi_pd[k]**2*meff[k]))
+            k=k+1
+        
+        print("wk_eff "+str(wk_eff))    
+        #calculation of psik_eff
+        k=0    
+        for fr in frs:
+            xik[k] = (tabdmp[k]+phi_pd[k]**2*deff[k])/(2*(1+phi_pd[k]**2*meff[k])*2*3.1415*wk_eff[k])
+            k=k+1
+        print("xik "+str(xik))
+            
+        #calculation of Qk
+        k=0
+        F=10
+        for fr in frs:
+            Qk[k] = (phi_sh[k]*F)/(2*(1+phi_pd[k]**2*meff[k])*xik[k]*(2*3.1415*wk_eff[k])**2)
+            k=k+1    
+        print("Qk "+str(Qk))
+        
+        #calculation of Xk
+        k=0
+        F=1
+        for fr in frs:
+            Xk[k] = phi_pd[k]*Qk[k]
+            k=k+1    
+        print("Xk "+str(Xk))
+        
+        #calculation of gammak
+        k=0
+        F=10
+        for fr in frs:
+            gammak[k] = phi_pd[k]*Qk[k]*(fr)**2/9.81
+            k=k+1    
+        print("gammak "+str(gammak))    
+         
+        #creates a new bdf and runs nastran to generate a new freq response result
+        file_fresp = fresp_recalc(bdf_filename, xik,it,frs)
+        
+        it=it+1
+        
+        
+
+    
+    
+        
+    
+    
+    
+
+    
+
+    
+    
+    
